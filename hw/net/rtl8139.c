@@ -63,9 +63,10 @@
 #include "net/eth.h"
 #include "sysemu/sysemu.h"
 #include "qom/object.h"
+#include "hw/pci/msi.h"
 
 /* debug RTL8139 card */
-//#define DEBUG_RTL8139 1
+#define DEBUG_RTL8139 1
 
 #define PCI_PERIOD 30    /* 30 ns period = 33.333333 Mhz frequency */
 
@@ -714,7 +715,14 @@ static void rtl8139_update_irq(RTL8139State *s)
     DPRINTF("Set IRQ to %d (%04x %04x)\n", isr ? 1 : 0, s->IntrStatus,
         s->IntrMask);
 
-    pci_set_irq(d, (isr != 0));
+
+    if (msi_enabled(d)) {
+        if (isr != 0) {
+            msi_notify(d, 0);
+        }
+    } else {
+        pci_set_irq(d, (isr != 0));
+    }
 }
 
 static int rtl8139_RxWrap(RTL8139State *s)
@@ -3406,6 +3414,8 @@ static void pci_rtl8139_realize(PCIDevice *dev, Error **errp)
     s->cplus_txbuffer_offset = 0;
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rtl8139_timer, s);
+    Error *err = NULL;
+    msi_init(dev, 0x70, 1, false, false, &err);
 }
 
 static void rtl8139_instance_init(Object *obj)
