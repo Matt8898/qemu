@@ -25,8 +25,7 @@ struct descriptor {
     unsigned int status; // Initialized to 0 by the guest; host writes 1 on completion.
     uint64_t payload; // Ptr to buffer.
     uint64_t size; // Size of buffer.
-    uint64_t msi_address;
-    uint64_t msi_data;
+    size_t actual_length;
 };
 
 typedef struct {
@@ -71,7 +70,6 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         case 0x0 :;
             struct descriptor descr = {0};
 		    dma_memory_read(&address_space_memory, val, &descr, sizeof(struct descriptor));
-		    dma_memory_read(&address_space_memory, val, &descr, sizeof(struct descriptor));
             
             size_t size = descr.size;
 
@@ -84,6 +82,9 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             if (descr.flags) {
                 msi_notify(&dmalog->pdev, 0);
             }
+
+            descr.status = 1;
+    	    dma_memory_write(&address_space_memory, val, &descr, sizeof(struct descriptor));
             break;
         case 0x8:
             dma_memory_read(&address_space_memory, val, &dmalog->in_descriptor, sizeof(struct descriptor));
@@ -135,12 +136,11 @@ void dmalog_handle_read(void *opaque, const uint8_t *buf, int size) {
 
     dmalog->cur += to_copy;
 
-    if (dmalog->cur == limit || buf[size - 1] == '\n') {
-        dmalog->in_descriptor.status = 1;
-	    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, &dmalog->in_descriptor, sizeof(struct descriptor));
-        if (dmalog->in_descriptor.flags) {
-            msi_notify(&dmalog->pdev, 0);
-        }
+    dmalog->in_descriptor.status = 1;
+    dmalog->in_descriptor.actual_length = size;
+    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, &dmalog->in_descriptor, sizeof(struct descriptor));
+    if (dmalog->in_descriptor.flags) {
+        msi_notify(&dmalog->pdev, 0);
     }
 }
 
