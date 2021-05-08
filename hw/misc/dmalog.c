@@ -28,6 +28,19 @@ struct descriptor {
     size_t actual_length;
 };
 
+struct buffer {
+    uint64_t ptr;
+    size_t size;
+};
+
+struct sgl_descriptor {
+    unsigned int flags; // If bit 1 is set, send MSI on completion.
+    unsigned int status; // Initialized to 0 by the guest; host writes 1 on completion.
+    size_t actual_length;
+    size_t num_buffers;
+    struct buffer buffers[];
+};
+
 typedef struct {
     PCIDevice pdev;
     MemoryRegion mmio;
@@ -36,8 +49,13 @@ typedef struct {
 	size_t   region_size;
 
     uint64_t in_descriptor_addr;
-    struct descriptor in_descriptor;
+    struct sgl_descriptor* in_descriptor;
+    size_t in_space;
+    struct buffer* out_buffers;
+    struct buffer* in_buffers;
+    //offset into the current in_buffer
     size_t cur;
+    size_t cur_buffer;
     bool in_valid;
 
     uint32_t irq_status;
@@ -68,29 +86,48 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     DmalogState *dmalog = opaque;
     switch (addr) {
         case 0x0 :;
-            struct descriptor descr = {0};
-		    dma_memory_read(&address_space_memory, val, &descr, sizeof(struct descriptor));
-            
-            size_t size = descr.size;
+            struct sgl_descriptor descr = {0};
+		    dma_memory_read(&address_space_memory, val, &descr, sizeof(struct sgl_descriptor));
+            size_t num_buffers = descr.num_buffers;
+            size_t buffer_start = (size_t)offsetof(struct sgl_descriptor, buffers) + val;
+            size_t cur_buffer = 0;
+    		dma_memory_read(&address_space_memory, buffer_start, dmalog->out_buffers, sizeof(struct buffer) * num_buffers);
+            fprintf(stderr, "allocating %lx\n", num_buffers);
+            while (cur_buffer < num_buffers) {
+                struct buffer cur = dmalog->out_buffers[cur_buffer];
 
-            while (size) {
-                size_t to_read = (size < DMA_SIZE) ? size : DMA_SIZE;
-		        dma_memory_read(&address_space_memory, descr.payload, dmalog->dma_buf, to_read);
-                qemu_chr_fe_write_all(&dmalog->chr, (const uint8_t *)dmalog->dma_buf, to_read);
-                size -= to_read;
+                size_t size = cur.size;
+
+                while (size) {
+                    size_t to_read = (size < DMA_SIZE) ? size : DMA_SIZE;
+                    dma_memory_read(&address_space_memory, cur.ptr, dmalog->dma_buf, to_read);
+                    qemu_chr_fe_write_all(&dmalog->chr, (const uint8_t *)dmalog->dma_buf, to_read);
+                    size -= to_read;
+                }
+
+                cur_buffer++;
             }
+
             if (descr.flags) {
                 msi_notify(&dmalog->pdev, 0);
             }
 
             descr.status = 1;
-    	    dma_memory_write(&address_space_memory, val, &descr, sizeof(struct descriptor));
+    	    dma_memory_write(&address_space_memory, val, &descr, sizeof(struct sgl_descriptor));
             break;
         case 0x8:
-            dma_memory_read(&address_space_memory, val, &dmalog->in_descriptor, sizeof(struct descriptor));
+            dma_memory_read(&address_space_memory, val, dmalog->in_descriptor, sizeof(struct sgl_descriptor));
+            buffer_start = (size_t)offsetof(struct sgl_descriptor, buffers) + val;
+            fprintf(stderr, "%lx\n", buffer_start);
+    		dma_memory_read(&address_space_memory, buffer_start, dmalog->in_descriptor->buffers, sizeof(struct buffer) * dmalog->in_descriptor->num_buffers);
             dmalog->cur = 0;
+            dmalog->cur_buffer = 0;
             dmalog->in_descriptor_addr = val;
             dmalog->in_valid = true;
+            for (size_t i = 0; i < dmalog->in_descriptor->num_buffers; i++) {
+                dmalog->in_space += dmalog->in_descriptor->buffers[i].size;
+            }
+            break;
     }
 
 }
@@ -124,22 +161,58 @@ void dmalog_handle_read(void *opaque, const uint8_t *buf, int size) {
         return;
     }
 
-    if (dmalog->in_descriptor.status) {
+    if (dmalog->in_descriptor->status) {
         return;
     }
+    /*
+    size_t to_copy = ((dmalog->cur + size) > dmalog->in_space) ? size : (dmalog->in_space - dmalog->cur);
+    size_t progress = 0;
+    size_t cur_buffer = dmalog->cur_buffer;
 
-    size_t limit = dmalog->in_descriptor.size;
+    while (progress < to_copy) {
+        struct buffer* cur = &dmalog->in_descriptor->buffers[cur_buffer];
+        size_t to_transfer = 0;
+        if ((to_copy - progress) > cur->size) {
+            cur_buffer++;
+            to_transfer = cur->size;
+        } else {
+            to_transfer = (to_copy - progress);
+        }
+	    dma_memory_write(&address_space_memory, cur->ptr + dmalog->cur, buf + progress, to_transfer);
+        if ((to_copy - progress) > cur->size) {
+            dmalog->cur = 0;
+        } else {
+            dmalog->cur += to_transfer;
+        }
+        progress += to_transfer;
+    }
 
-    size_t to_copy = ((dmalog->cur + size) > limit) ? size : (limit - dmalog->cur);
 
-	dma_memory_write(&address_space_memory, dmalog->in_descriptor.payload + dmalog->cur, buf, to_copy);
+    dmalog->in_descriptor->status = 1;
+    dmalog->in_descriptor->actual_length = size;
+    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, sizeof(struct descriptor));
+    if (dmalog->in_descriptor->flags) {
+        msi_notify(&dmalog->pdev, 0);
+    }
+    */
+    size_t progress = 0;
 
-    dmalog->cur += to_copy;
+    while (progress < size) {
+        struct buffer* cur = &dmalog->in_descriptor->buffers[dmalog->cur_buffer];
+        size_t to_transfer = ((size - progress) > (cur->size - dmalog->cur)) ? (cur->size - dmalog->cur) : (size - progress);
+        dma_memory_write(&address_space_memory, cur->ptr + dmalog->cur, buf + progress, to_transfer);
+        dmalog->cur += to_transfer;
+        progress += to_transfer;
+        if (dmalog->cur == cur->size) {
+            dmalog->cur_buffer++;
+            dmalog->cur = 0;
+        }
+    }
 
-    dmalog->in_descriptor.status = 1;
-    dmalog->in_descriptor.actual_length = size;
-    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, &dmalog->in_descriptor, sizeof(struct descriptor));
-    if (dmalog->in_descriptor.flags) {
+    dmalog->in_descriptor->status = 1;
+    dmalog->in_descriptor->actual_length = size;
+    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, sizeof(struct descriptor));
+    if (dmalog->in_descriptor->flags) {
         msi_notify(&dmalog->pdev, 0);
     }
 }
@@ -151,13 +224,12 @@ static int dmalog_can_recv(void *opaque) {
         return 0;
     }
 
-    if (dmalog->in_descriptor.status) {
+    if (dmalog->in_descriptor->status) {
         return 0;
     }
 
-    size_t limit = dmalog->in_descriptor.size;
-
-    return (limit - dmalog->cur);
+    return dmalog->in_space;
+    return 0;
 }
 
 static void pci_dmalog_realize(PCIDevice *pdev, Error **errp)
@@ -182,13 +254,15 @@ static void pci_dmalog_realize(PCIDevice *pdev, Error **errp)
 
 static void pci_dmalog_uninit(PCIDevice *pdev)
 {
-    //msi_uninit(pdev);
+    msi_uninit(pdev);
 }
 
 static void dmalog_instance_init(Object *obj)
 {
     DmalogState *dmalog = DMALOG(obj);
     dmalog->in_valid = false;
+    dmalog->out_buffers = malloc(sizeof(struct buffer) * 64);
+    dmalog->in_descriptor = malloc(sizeof(struct sgl_descriptor) + sizeof(struct buffer) * 64);
 
     dmalog->dma_mask = (1UL << 28) - 1;
     object_property_add_uint64_ptr(obj, "dma_mask",
