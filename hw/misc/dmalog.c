@@ -67,6 +67,9 @@ typedef struct {
     uint64_t dma_mask;
     char* tag;
     size_t taglen;
+
+    bool out_pending;
+    bool in_pending;
 } DmalogState;
 
 static uint64_t dmalog_mmio_read(void *opaque, hwaddr addr, unsigned size) {
@@ -108,8 +111,13 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                 cur_buffer++;
             }
 
-            if (descr.flags) {
-                msi_notify(&dmalog->pdev, 0);
+            if (descr.flags && !dmalog->out_pending) {
+                if (msi_enabled(&dmalog->pdev)) {
+                    msi_notify(&dmalog->pdev, 0);
+                } else {
+                    pci_set_irq(&dmalog->pdev, 1);
+                }
+                dmalog->out_pending = 1;
             }
 
             descr.status = 1;
@@ -126,6 +134,13 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             dmalog->in_valid = true;
             for (size_t i = 0; i < dmalog->in_descriptor->num_buffers; i++) {
                 dmalog->in_space += dmalog->in_descriptor->buffers[i].size;
+            }
+            break;
+        case 0x10:
+            if (val & 0b1) {
+                dmalog->out_pending = 0;
+            } else if (val & 0b10) {
+                dmalog->in_pending = 0;
             }
             break;
     }
@@ -212,8 +227,13 @@ void dmalog_handle_read(void *opaque, const uint8_t *buf, int size) {
     dmalog->in_descriptor->status = 1;
     dmalog->in_descriptor->actual_length = size;
     dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, sizeof(struct descriptor));
-    if (dmalog->in_descriptor->flags) {
-        msi_notify(&dmalog->pdev, 0);
+    if (dmalog->in_descriptor->flags && !dmalog->in_pending) {
+        if (msi_enabled(&dmalog->pdev)) {
+            msi_notify(&dmalog->pdev, 0);
+        } else {
+            pci_set_irq(&dmalog->pdev, 1);
+        }
+        dmalog->in_pending = 1;
     }
 }
 
@@ -261,6 +281,9 @@ static void dmalog_instance_init(Object *obj)
 {
     DmalogState *dmalog = DMALOG(obj);
     dmalog->in_valid = false;
+    dmalog->in_pending = false;
+    dmalog->out_pending = false;
+
     dmalog->out_buffers = malloc(sizeof(struct buffer) * 64);
     dmalog->in_descriptor = malloc(sizeof(struct sgl_descriptor) + sizeof(struct buffer) * 64);
 
