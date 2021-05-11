@@ -75,8 +75,14 @@ typedef struct {
 static uint64_t dmalog_mmio_read(void *opaque, hwaddr addr, unsigned size) {
     DmalogState *dmalog = opaque;
 
-    if ((addr >= 0x10) && (addr <= (0x10 + 64))) {
-        size_t idx = addr - 0x10;
+    if (addr == 0x10) {
+        uint64_t ret = 0;
+        ret |= (dmalog->out_pending) | (dmalog->in_pending << 1);
+        return ret;
+    }
+
+    if ((addr >= 0x40) && (addr <= (0x40 + 64))) {
+        size_t idx = addr - 0x40;
         return (idx < dmalog->taglen) ? dmalog->tag[idx] : 0;
     }
     return 0;
