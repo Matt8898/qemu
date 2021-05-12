@@ -20,14 +20,6 @@
 #define DMA_START       0x40000
 #define DMA_SIZE        16384
 
-struct descriptor {
-    unsigned int flags; // If bit 1 is set, send MSI on completion.
-    unsigned int status; // Initialized to 0 by the guest; host writes 1 on completion.
-    uint64_t payload; // Ptr to buffer.
-    uint64_t size; // Size of buffer.
-    size_t actual_length;
-};
-
 struct buffer {
     uint64_t ptr;
     size_t size;
@@ -102,6 +94,7 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             size_t cur_buffer = 0;
     		dma_memory_read(&address_space_memory, buffer_start, dmalog->out_buffers, sizeof(struct buffer) * num_buffers);
             fprintf(stderr, "allocating %lx\n", num_buffers);
+            size_t total = 0;
             while (cur_buffer < num_buffers) {
                 struct buffer cur = dmalog->out_buffers[cur_buffer];
 
@@ -112,6 +105,7 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                     dma_memory_read(&address_space_memory, cur.ptr, dmalog->dma_buf, to_read);
                     qemu_chr_fe_write_all(&dmalog->chr, (const uint8_t *)dmalog->dma_buf, to_read);
                     size -= to_read;
+                    total += to_read;
                 }
 
                 cur_buffer++;
@@ -127,6 +121,7 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             }
 
             descr.status = 1;
+            descr.actual_length = total;
     	    dma_memory_write(&address_space_memory, val, &descr, sizeof(struct sgl_descriptor));
             break;
         case 0x8:
@@ -145,8 +140,12 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         case 0x10:
             if (val & 0b1) {
                 dmalog->out_pending = 0;
-            } else if (val & 0b10) {
+            }
+            if (val & 0b10) {
                 dmalog->in_pending = 0;
+            }
+            if (!msi_enabled(&dmalog->pdev) && !dmalog->out_pending && !dmalog->in_pending) {
+                pci_set_irq(&dmalog->pdev, 0);
             }
             break;
     }
@@ -232,7 +231,7 @@ void dmalog_handle_read(void *opaque, const uint8_t *buf, int size) {
 
     dmalog->in_descriptor->status = 1;
     dmalog->in_descriptor->actual_length = size;
-    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, sizeof(struct descriptor));
+    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, sizeof(struct sgl_descriptor));
     if (dmalog->in_descriptor->flags && !dmalog->in_pending) {
         if (msi_enabled(&dmalog->pdev)) {
             msi_notify(&dmalog->pdev, 0);
