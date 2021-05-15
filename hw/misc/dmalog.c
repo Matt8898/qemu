@@ -8,6 +8,7 @@
 #include "qemu/module.h"
 #include "qapi/visitor.h"
 #include "chardev/char.h"
+#include "qemu/atomic.h"
 #include "chardev/char-fe.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
@@ -26,10 +27,10 @@ struct buffer {
 };
 
 struct sgl_descriptor {
-    unsigned int flags; // If bit 1 is set, send MSI on completion.
-    unsigned int status; // Initialized to 0 by the guest; host writes 1 on completion.
-    size_t actual_length;
-    size_t num_buffers;
+    uint64_t status; // Initialized to 0 by the guest; host writes 1 on completion.
+    uint64_t actual_length;
+    uint64_t flags; // If bit 1 is set, send MSI on completion.
+    uint64_t num_buffers;
     struct buffer buffers[];
 };
 
@@ -62,6 +63,9 @@ typedef struct {
 
     bool out_pending;
     bool in_pending;
+
+    bool out_busy;
+    bool in_busy;
 } DmalogState;
 
 static uint64_t dmalog_mmio_read(void *opaque, hwaddr addr, unsigned size) {
@@ -103,7 +107,7 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                 while (size) {
                     size_t to_read = (size < DMA_SIZE) ? size : DMA_SIZE;
                     dma_memory_read(&address_space_memory, cur.ptr, dmalog->dma_buf, to_read);
-                    qemu_chr_fe_write_all(&dmalog->chr, (const uint8_t *)dmalog->dma_buf, to_read);
+                    qemu_chr_fe_write(&dmalog->chr, (const uint8_t *)dmalog->dma_buf, to_read);
                     size -= to_read;
                     total += to_read;
                 }
@@ -122,7 +126,7 @@ static void dmalog_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 
             descr.status = 1;
             descr.actual_length = total;
-    	    dma_memory_write(&address_space_memory, val, &descr, sizeof(struct sgl_descriptor));
+    	    dma_memory_write(&address_space_memory, val, &descr, offsetof(struct sgl_descriptor, flags));
             break;
         case 0x8:
             dma_memory_read(&address_space_memory, val, dmalog->in_descriptor, sizeof(struct sgl_descriptor));
@@ -231,7 +235,7 @@ void dmalog_handle_read(void *opaque, const uint8_t *buf, int size) {
 
     dmalog->in_descriptor->status = 1;
     dmalog->in_descriptor->actual_length = size;
-    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, sizeof(struct sgl_descriptor));
+    dma_memory_write(&address_space_memory, dmalog->in_descriptor_addr, dmalog->in_descriptor, offsetof(struct sgl_descriptor, flags));
     if (dmalog->in_descriptor->flags && !dmalog->in_pending) {
         if (msi_enabled(&dmalog->pdev)) {
             msi_notify(&dmalog->pdev, 0);
@@ -288,6 +292,8 @@ static void dmalog_instance_init(Object *obj)
     dmalog->in_valid = false;
     dmalog->in_pending = false;
     dmalog->out_pending = false;
+    dmalog->in_busy = false;
+    dmalog->out_busy = false;
 
     dmalog->out_buffers = malloc(sizeof(struct buffer) * 64);
     dmalog->in_descriptor = malloc(sizeof(struct sgl_descriptor) + sizeof(struct buffer) * 64);
